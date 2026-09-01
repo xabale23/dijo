@@ -1,34 +1,23 @@
 -- ============================================
 -- DIJO Migration 005
--- Identity Architecture Reconciliation
+-- Legacy Identity Reconciliation Record
 -- ============================================
 
-begin;
+-- Historical note:
+--
+-- During pre-launch development, DIJO originally used
+-- public.users as its application identity table.
+--
+-- The live development database was reconciled so that:
+--
+--   businesses.owner_id -> public.profiles(id)
+--   orders.customer_id  -> public.profiles(id)
+--
+-- The legacy public.users table was then removed.
+--
+-- The corrected pre-launch baseline migrations now create
+-- these relationships directly against public.profiles.
+--
+-- Therefore no database operation is required here.
 
--- Move business ownership from the legacy
--- public.users table to Supabase-backed profiles.
-alter table public.businesses
-drop constraint if exists businesses_owner_id_fkey;
-
-alter table public.businesses
-add constraint businesses_owner_id_fkey
-foreign key (owner_id)
-references public.profiles(id)
-on delete cascade;
-
-
--- Move order customers from the legacy
--- public.users table to Supabase-backed profiles.
-alter table public.orders
-drop constraint if exists orders_customer_id_fkey;
-
-alter table public.orders
-add constraint orders_customer_id_fkey
-foreign key (customer_id)
-references public.profiles(id);
-
-
--- The legacy identity table is no longer required.
-drop table if exists public.users;
-
-commit;
+select 1;
