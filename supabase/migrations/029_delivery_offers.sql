@@ -173,14 +173,14 @@ on public.delivery_offers (
 where status = 'pending'::public.delivery_offer_status;
 
 
--- Only one offer can ever be accepted for a particular order.
-
-create unique index if not exists
-delivery_offers_one_accepted_per_order_idx
-on public.delivery_offers (
-    order_id
-)
-where status = 'accepted'::public.delivery_offer_status;
+-- Accepted offers are retained as historical records.
+--
+-- Do NOT enforce one accepted offer per order for the lifetime
+-- of the order. A pre-pickup assignment may later be released
+-- and the same order may legitimately be re-offered.
+--
+-- Atomic winner selection is enforced by the FOR UPDATE lock
+-- on the order row inside accept_delivery_offer().
 
 
 -- Defense-in-depth:
