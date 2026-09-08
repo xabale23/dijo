@@ -65,7 +65,7 @@ declare
     v_actor_id uuid;
 
     v_business_id uuid;
-    v_pickup_coordinates geography;
+    v_pickup_coordinates public.geography;
 
     v_is_business_member boolean := false;
     v_is_admin boolean := false;
