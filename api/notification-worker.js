@@ -1,9 +1,10 @@
 // DIJO Notification Worker
-// Phase 5A:
+// Phase 5B:
 // - Supabase connectivity
-// - Meta WhatsApp connectivity
-// - Secure queue claiming
-// - NO WhatsApp message sending yet
+// - Meta connectivity
+// - Secure template discovery
+// - Secure queue claim testing
+// - NO WhatsApp sending yet
 
 const WORKER_ID = "dijo-vercel-worker-v1";
 const META_GRAPH_VERSION = "v26.0";
@@ -62,14 +63,8 @@ async function checkMetaConnection(
   const text = await response.text();
 
   if (!response.ok) {
-    console.error(
-      "Meta WhatsApp connectivity check failed:",
-      response.status,
-      text
-    );
-
     throw new Error(
-      `Meta Graph API request failed (${response.status})`
+      `Meta Graph API request failed (${response.status}): ${text}`
     );
   }
 
@@ -79,14 +74,49 @@ async function checkMetaConnection(
     ? result.data
     : [];
 
-  const matched = numbers.some(
-    (item) => String(item.id) === String(phoneNumberId)
-  );
-
   return {
     connected: true,
-    phoneNumberMatched: matched,
+    phoneNumberMatched: numbers.some(
+      (item) =>
+        String(item.id) === String(phoneNumberId)
+    ),
   };
+}
+
+async function getMetaTemplates(
+  accessToken,
+  businessAccountId
+) {
+  const url =
+    `https://graph.facebook.com/${META_GRAPH_VERSION}/` +
+    `${businessAccountId}/message_templates` +
+    `?fields=name,status,language,category&limit=100`;
+
+  const response = await fetch(url, {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+    },
+  });
+
+  const text = await response.text();
+
+  if (!response.ok) {
+    throw new Error(
+      `Meta template request failed (${response.status}): ${text}`
+    );
+  }
+
+  const result = JSON.parse(text);
+
+  return Array.isArray(result.data)
+    ? result.data.map((template) => ({
+        name: template.name,
+        status: template.status,
+        language: template.language,
+        category: template.category,
+      }))
+    : [];
 }
 
 module.exports = async function handler(req, res) {
@@ -110,6 +140,9 @@ module.exports = async function handler(req, res) {
   const whatsappBusinessAccountId =
     process.env.WHATSAPP_BUSINESS_ACCOUNT_ID;
 
+  const whatsappTestRecipient =
+    process.env.WHATSAPP_TEST_RECIPIENT;
+
 
   // ==========================================================
   // PUBLIC READ-ONLY HEALTH CHECK
@@ -129,6 +162,9 @@ module.exports = async function handler(req, res) {
       whatsappBusinessAccountId
     );
 
+    const testRecipientConfigured =
+      Boolean(whatsappTestRecipient);
+
     if (!supabaseConfigured || !metaConfigured) {
       return res.status(500).json({
         ok: false,
@@ -136,14 +172,11 @@ module.exports = async function handler(req, res) {
         status: "misconfigured",
         supabaseConfigured,
         metaConfigured,
+        testRecipientConfigured,
       });
     }
 
     try {
-
-      // -------------------------------------------------------
-      // SUPABASE READ-ONLY CHECK
-      // -------------------------------------------------------
 
       const connected =
         await callSupabaseRpc(
@@ -158,18 +191,6 @@ module.exports = async function handler(req, res) {
           }
         );
 
-      const supabaseConnected =
-        connected === false ||
-        connected === true;
-
-
-      // -------------------------------------------------------
-      // META READ-ONLY CHECK
-      //
-      // Lists WABA phone numbers.
-      // Does NOT call /messages.
-      // -------------------------------------------------------
-
       const meta =
         await checkMetaConnection(
           whatsappAccessToken,
@@ -177,20 +198,23 @@ module.exports = async function handler(req, res) {
           whatsappPhoneNumberId
         );
 
-
       return res.status(200).json({
         ok: true,
         service: "dijo-notification-worker",
         status: "ready",
 
         supabaseConfigured: true,
-        supabaseConnected,
+        supabaseConnected:
+          connected === false ||
+          connected === true,
 
         metaConfigured: true,
         metaConnected: meta.connected,
 
         phoneNumberMatched:
           meta.phoneNumberMatched,
+
+        testRecipientConfigured,
 
         metaGraphVersion:
           META_GRAPH_VERSION,
@@ -215,7 +239,7 @@ module.exports = async function handler(req, res) {
 
 
   // ==========================================================
-  // ONLY POST MAY PROCESS QUEUE
+  // ONLY POST MAY ACCESS PROTECTED WORKER OPERATIONS
   // ==========================================================
 
   if (req.method !== "POST") {
@@ -227,7 +251,7 @@ module.exports = async function handler(req, res) {
 
 
   // ==========================================================
-  // PROTECT WORKER
+  // AUTHENTICATE WORKER REQUEST
   // ==========================================================
 
   const suppliedSecret =
@@ -245,21 +269,79 @@ module.exports = async function handler(req, res) {
   }
 
 
-  if (!supabaseUrl || !serviceRoleKey) {
-    return res.status(500).json({
-      ok: false,
-      error: "Worker environment is not configured",
-    });
+  const action =
+    req.body?.action || "claim_test";
+
+
+  // ==========================================================
+  // ACTION: LIST META TEMPLATES
+  // ==========================================================
+
+  if (action === "list_templates") {
+
+    if (
+      !whatsappAccessToken ||
+      !whatsappBusinessAccountId
+    ) {
+      return res.status(500).json({
+        ok: false,
+        error:
+          "Meta environment is not configured",
+      });
+    }
+
+    try {
+
+      const templates =
+        await getMetaTemplates(
+          whatsappAccessToken,
+          whatsappBusinessAccountId
+        );
+
+      return res.status(200).json({
+        ok: true,
+        action: "list_templates",
+        count: templates.length,
+        templates,
+        messageSendingEnabled: false,
+      });
+
+    } catch (error) {
+
+      console.error(
+        "Template discovery failed:",
+        error
+      );
+
+      return res.status(502).json({
+        ok: false,
+        error:
+          "Meta template discovery failed",
+      });
+    }
   }
 
 
   // ==========================================================
-  // PHASE 4 TEST BEHAVIOUR
-  //
-  // Still claim exactly one job.
-  // Still DO NOT send to Meta.
-  // Still safely requeue it.
+  // ACTION: PHASE 4/5 CLAIM TEST
   // ==========================================================
+
+  if (action !== "claim_test") {
+    return res.status(400).json({
+      ok: false,
+      error: "Unknown worker action",
+    });
+  }
+
+
+  if (!supabaseUrl || !serviceRoleKey) {
+    return res.status(500).json({
+      ok: false,
+      error:
+        "Worker environment is not configured",
+    });
+  }
+
 
   try {
 
@@ -292,13 +374,7 @@ module.exports = async function handler(req, res) {
     const job = jobs[0];
 
 
-    // --------------------------------------------------------
-    // SAFETY:
-    //
     // Meta sending is still disabled.
-    // Return claimed job to pending.
-    // --------------------------------------------------------
-
     await callSupabaseRpc(
       supabaseUrl,
       serviceRoleKey,
@@ -311,7 +387,7 @@ module.exports = async function handler(req, res) {
           WORKER_ID,
 
         p_error:
-          "DIJO worker Phase 5A - provider send disabled",
+          "DIJO worker Phase 5B - provider send disabled",
 
         p_retry_after_seconds:
           60,
