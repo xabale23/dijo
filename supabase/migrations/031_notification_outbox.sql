@@ -25,10 +25,21 @@
 -- SECURITY
 -- --------
 -- The outbox is backend-only.
+--
 -- anon/authenticated clients receive no direct table access
 -- and cannot execute worker RPCs.
 --
 -- Worker RPCs are service_role only.
+--
+-- HARDENING
+-- ---------
+-- 1. Drivers without usable WhatsApp numbers cannot be claimed.
+-- 2. Closed/expired delivery offers cannot be claimed.
+-- 3. A notification already claimed by a worker is not
+--    cancelled underneath that worker.
+-- 4. Abandoned processing jobs are recovered safely.
+-- 5. Multiple workers may claim jobs concurrently through
+--    FOR UPDATE SKIP LOCKED.
 --
 -- ============================================================
 
@@ -48,10 +59,12 @@ begin
         where n.nspname = 'public'
           and t.typname = 'notification_channel'
     ) then
+
         create type public.notification_channel
         as enum (
             'whatsapp'
         );
+
     end if;
 
 
@@ -63,6 +76,7 @@ begin
         where n.nspname = 'public'
           and t.typname = 'notification_outbox_status'
     ) then
+
         create type public.notification_outbox_status
         as enum (
             'pending',
@@ -71,6 +85,7 @@ begin
             'failed',
             'cancelled'
         );
+
     end if;
 
 end
@@ -237,14 +252,13 @@ enable row level security;
 -- No client-facing RLS policies are intentionally created.
 -- The outbox is backend infrastructure.
 
-
 revoke all
 on public.notification_outbox
 from anon, authenticated;
 
 
--- Even service_role should use the controlled worker RPCs
--- instead of mutating the queue table directly.
+-- Even service_role should use controlled worker RPCs rather
+-- than directly mutating the outbox table.
 
 revoke all
 on public.notification_outbox
@@ -274,6 +288,10 @@ declare
     v_notification_id uuid;
     v_idempotency_key text;
 begin
+
+    -- ========================================================
+    -- INPUT VALIDATION
+    -- ========================================================
 
     if p_recipient_profile_id is null then
         raise exception
@@ -336,6 +354,10 @@ begin
     end if;
 
 
+    -- ========================================================
+    -- IDEMPOTENCY KEY
+    -- ========================================================
+
     v_idempotency_key := coalesce(
         nullif(
             btrim(p_idempotency_key),
@@ -354,6 +376,10 @@ begin
             'idempotency_key cannot exceed 250 characters';
     end if;
 
+
+    -- ========================================================
+    -- INSERT JOB
+    -- ========================================================
 
     insert into public.notification_outbox (
         recipient_profile_id,
@@ -393,8 +419,9 @@ begin
     into v_notification_id;
 
 
-    -- Idempotent replay:
-    -- return the existing job instead of creating a duplicate.
+    -- ========================================================
+    -- IDEMPOTENT REPLAY
+    -- ========================================================
 
     if v_notification_id is null then
 
@@ -521,6 +548,15 @@ public.enqueue_delivery_offer_notification();
 -- ============================================================
 -- 7. CANCEL UNSENT OFFER NOTIFICATION WHEN OFFER CLOSES
 -- ============================================================
+--
+-- Only PENDING notifications are cancelled here.
+--
+-- A PROCESSING notification is already owned by a worker.
+-- Changing its status underneath that worker could result in
+-- Meta successfully sending the message while the worker can
+-- no longer acknowledge the job.
+--
+-- ============================================================
 
 create or replace function
 public.cancel_delivery_offer_notification()
@@ -549,10 +585,8 @@ begin
 
         where n.source_type = 'delivery_offer'
           and n.source_id = new.id
-          and n.status in (
-              'pending'::public.notification_outbox_status,
-              'processing'::public.notification_outbox_status
-          );
+          and n.status =
+              'pending'::public.notification_outbox_status;
 
     end if;
 
@@ -593,10 +627,11 @@ public.cancel_delivery_offer_notification();
 -- 8. WORKER: CLAIM NOTIFICATION JOBS
 -- ============================================================
 --
--- Uses FOR UPDATE SKIP LOCKED so multiple Vercel workers can
+-- Uses FOR UPDATE SKIP LOCKED so multiple backend workers can
 -- safely claim separate jobs concurrently.
 --
--- A stale processing lease can be recovered automatically.
+-- Processing jobs use a lease. If a worker crashes, the job
+-- can later be recovered and retried.
 --
 -- ============================================================
 
@@ -628,6 +663,10 @@ as $function$
 
 begin
 
+    -- ========================================================
+    -- INPUT VALIDATION
+    -- ========================================================
+
     if p_worker_id is null
        or btrim(p_worker_id) = '' then
         raise exception
@@ -657,9 +696,10 @@ begin
     end if;
 
 
-    -- --------------------------------------------------------
-    -- Processing jobs that exhausted retries become terminal.
-    -- --------------------------------------------------------
+    -- ========================================================
+    -- TERMINATE ABANDONED PROCESSING JOBS THAT HAVE EXHAUSTED
+    -- ALL RETRIES
+    -- ========================================================
 
     update public.notification_outbox n
     set
@@ -694,9 +734,9 @@ begin
       and n.attempt_count >= n.max_attempts;
 
 
-    -- --------------------------------------------------------
-    -- Recover abandoned jobs that still have retries.
-    -- --------------------------------------------------------
+    -- ========================================================
+    -- RECOVER ABANDONED PROCESSING JOBS THAT STILL HAVE RETRIES
+    -- ========================================================
 
     update public.notification_outbox n
     set
@@ -723,9 +763,12 @@ begin
       and n.attempt_count < n.max_attempts;
 
 
-    -- --------------------------------------------------------
-    -- Pending jobs that somehow exhausted attempts are closed.
-    -- --------------------------------------------------------
+    -- ========================================================
+    -- FAIL JOBS THAT HAVE NO DELIVERABLE WHATSAPP RECIPIENT
+    --
+    -- This runs AFTER lease recovery so recovered jobs are
+    -- also revalidated before they can be claimed again.
+    -- ========================================================
 
     update public.notification_outbox n
     set
@@ -737,6 +780,99 @@ begin
             now()
         ),
 
+        last_error =
+            case
+                when p.is_active is not true then
+                    'Recipient profile is inactive'
+                else
+                    'Recipient has no WhatsApp number'
+            end,
+
+        locked_at = null,
+        locked_by = null,
+
+        updated_at = now()
+
+    from public.profiles p
+
+    where p.id = n.recipient_profile_id
+
+      and n.status =
+          'pending'::public.notification_outbox_status
+
+      and (
+          p.is_active is not true
+          or p.whatsapp_number is null
+          or btrim(p.whatsapp_number) = ''
+      );
+
+
+    -- ========================================================
+    -- CANCEL DELIVERY-OFFER NOTIFICATIONS WHOSE OFFER IS
+    -- ALREADY CLOSED OR EXPIRED
+    --
+    -- This protects against:
+    --
+    --   accepted offers
+    --   rejected offers
+    --   cancelled offers
+    --   expired-status offers
+    --   pending offers whose expires_at has passed but whose
+    --   status has not yet been updated by the expiry worker
+    --
+    -- ========================================================
+
+    update public.notification_outbox n
+    set
+        status =
+            'cancelled'::public.notification_outbox_status,
+
+        locked_at = null,
+        locked_by = null,
+
+        updated_at = now()
+
+    where n.status =
+          'pending'::public.notification_outbox_status
+
+      and n.source_type = 'delivery_offer'
+
+      and (
+          n.source_id is null
+
+          or not exists (
+              select 1
+              from public.delivery_offers o
+              where o.id = n.source_id
+                and o.status =
+                    'pending'::public.delivery_offer_status
+                and o.expires_at > now()
+          )
+      );
+
+
+    -- ========================================================
+    -- PENDING JOBS THAT HAVE EXHAUSTED ATTEMPTS BECOME FAILED
+    -- ========================================================
+
+    update public.notification_outbox n
+    set
+        status =
+            'failed'::public.notification_outbox_status,
+
+        failed_at = coalesce(
+            n.failed_at,
+            now()
+        ),
+
+        locked_at = null,
+        locked_by = null,
+
+        last_error = coalesce(
+            n.last_error,
+            'Maximum notification attempts reached'
+        ),
+
         updated_at = now()
 
     where n.status =
@@ -745,14 +881,16 @@ begin
       and n.attempt_count >= n.max_attempts;
 
 
-    -- --------------------------------------------------------
-    -- Claim jobs atomically.
-    -- --------------------------------------------------------
+    -- ========================================================
+    -- CLAIM AVAILABLE JOBS ATOMICALLY
+    -- ========================================================
 
     return query
 
     with candidates as (
+
         select n.id
+
         from public.notification_outbox n
 
         join public.profiles p
@@ -767,6 +905,33 @@ begin
 
           and p.is_active is true
 
+          and p.whatsapp_number is not null
+
+          and btrim(p.whatsapp_number) <> ''
+
+          -- --------------------------------------------------
+          -- Defense-in-depth:
+          -- delivery-offer jobs are claimable only while the
+          -- source offer remains live.
+          -- --------------------------------------------------
+
+          and (
+              n.source_type is distinct from 'delivery_offer'
+
+              or (
+                  n.source_id is not null
+
+                  and exists (
+                      select 1
+                      from public.delivery_offers source_offer
+                      where source_offer.id = n.source_id
+                        and source_offer.status =
+                            'pending'::public.delivery_offer_status
+                        and source_offer.expires_at > now()
+                  )
+              )
+          )
+
         order by
             n.available_at asc,
             n.created_at asc,
@@ -779,6 +944,7 @@ begin
     ),
 
     claimed as (
+
         update public.notification_outbox n
         set
             status =
@@ -990,6 +1156,10 @@ begin
     end if;
 
 
+    -- ========================================================
+    -- LOCK JOB OWNED BY THIS WORKER
+    -- ========================================================
+
     select
         n.attempt_count,
         n.max_attempts
@@ -1012,6 +1182,10 @@ begin
             'Notification job is not owned by this worker';
     end if;
 
+
+    -- ========================================================
+    -- TERMINAL FAILURE
+    -- ========================================================
 
     if p_terminal is true
        or v_attempt_count >= v_max_attempts then
@@ -1037,6 +1211,11 @@ begin
         v_result_status :=
             'failed'::public.notification_outbox_status;
 
+
+    -- ========================================================
+    -- RETRY
+    -- ========================================================
+
     else
 
         v_retry_seconds := coalesce(
@@ -1044,6 +1223,7 @@ begin
 
             least(
                 1800,
+
                 (
                     30
                     * power(
@@ -1109,7 +1289,10 @@ owner to postgres;
 -- 11. FUNCTION EXECUTION PRIVILEGES
 -- ============================================================
 
--- Internal/backend enqueue function.
+
+-- ============================================================
+-- ENQUEUE
+-- ============================================================
 
 revoke all
 on function public.enqueue_notification(
@@ -1139,7 +1322,9 @@ on function public.enqueue_notification(
 to service_role;
 
 
--- Worker claim.
+-- ============================================================
+-- CLAIM
+-- ============================================================
 
 revoke all
 on function public.claim_notification_outbox(
@@ -1159,7 +1344,9 @@ on function public.claim_notification_outbox(
 to service_role;
 
 
--- Worker success acknowledgement.
+-- ============================================================
+-- MARK SENT
+-- ============================================================
 
 revoke all
 on function public.mark_notification_sent(
@@ -1179,7 +1366,9 @@ on function public.mark_notification_sent(
 to service_role;
 
 
--- Worker failure/retry acknowledgement.
+-- ============================================================
+-- MARK FAILED / RETRY
+-- ============================================================
 
 revoke all
 on function public.mark_notification_failed(
