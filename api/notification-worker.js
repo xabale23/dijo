@@ -269,8 +269,20 @@ module.exports = async function handler(req, res) {
   }
 
 
-  const action =
-    req.body?.action || "claim_test";
+  let parsedBody = req.body;
+
+if (typeof parsedBody === "string") {
+  try {
+    parsedBody = JSON.parse(parsedBody);
+  } catch {
+    parsedBody = {};
+  }
+}
+
+const action =
+  req.headers["x-dijo-action"] ||
+  parsedBody?.action ||
+  "claim_test";
 
 
   // ==========================================================
