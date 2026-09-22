@@ -1,6 +1,6 @@
 // ============================================================
 // DIJO Notification Worker
-// Phase 5C - Controlled WhatsApp Test Send
+// Phase 5D - WABA Webhook Subscription
 // ============================================================
 //
 // CAPABILITIES
@@ -9,21 +9,22 @@
 // 2. Supabase connectivity verification
 // 3. Meta WhatsApp connectivity verification
 // 4. Phone Number ID / WABA relationship verification
-// 5. Protected WhatsApp template discovery
-// 6. Protected notification queue claim testing
-// 7. ONE tightly controlled Meta WhatsApp test-send action
+// 5. Meta template discovery
+// 6. Notification-outbox claim testing
+// 7. Controlled WhatsApp test-template sending
+// 8. Subscribe DIJO app to configured WABA webhooks
 //
 // IMPORTANT
 // ---------
-// Production notification_outbox -> WhatsApp sending is
-// STILL DISABLED.
+// Production notification_outbox -> WhatsApp sending remains
+// DISABLED.
 //
-// send_test_template:
-//   - sends ONLY to WHATSAPP_TEST_RECIPIENT
-//   - uses a hard-coded approved Meta test template
-//   - does NOT accept a recipient from the caller
-//   - does NOT claim a notification_outbox job
-//   - requires explicit confirmation
+// subscribe_waba:
+//   - uses WHATSAPP_BUSINESS_ACCOUNT_ID from Vercel
+//   - uses WHATSAPP_ACCESS_TOKEN from Vercel
+//   - caller cannot supply another WABA
+//   - sends no WhatsApp message
+//   - touches no Supabase notification jobs
 //
 // ============================================================
 
@@ -42,10 +43,6 @@ const META_GRAPH_VERSION =
   "v26.0";
 
 
-// ------------------------------------------------------------
-// CONTROLLED TEST TEMPLATE
-// ------------------------------------------------------------
-
 const TEST_TEMPLATE_NAME =
   "jaspers_market_order_confirmation_v1";
 
@@ -53,14 +50,6 @@ const TEST_TEMPLATE_LANGUAGE =
   "en_US";
 
 
-// Fixed harmless test values.
-//
-// Meta template:
-//
-// {{1}} customer name
-// {{2}} order number
-// {{3}} estimated delivery
-//
 const TEST_TEMPLATE_PARAMETERS = [
   "DIJO Test",
   "DIJO-TEST-001",
@@ -68,10 +57,6 @@ const TEST_TEMPLATE_PARAMETERS = [
 ];
 
 
-// Explicit confirmation required in URL:
-//
-// ?action=send_test_template&confirm=SEND_DIJO_TEST
-//
 const TEST_SEND_CONFIRMATION =
   "SEND_DIJO_TEST";
 
@@ -136,18 +121,16 @@ function maskWhatsAppNumber(value) {
     return null;
   }
 
-  const lastFour =
-    normalized.slice(-4);
-
-  return `********${lastFour}`;
+  return `********${normalized.slice(-4)}`;
 }
 
 
 // ============================================================
-// REQUEST BODY PARSER
+// REQUEST BODY
 // ============================================================
 
 function parseRequestBody(req) {
+
   const body =
     req.body;
 
@@ -167,15 +150,13 @@ function parseRequestBody(req) {
 
   try {
 
-    const bodyText =
+    const text =
       Buffer.isBuffer(body)
         ? body.toString("utf8")
         : String(body);
 
 
-    return JSON.parse(
-      bodyText
-    );
+    return JSON.parse(text);
 
   } catch {
 
@@ -185,7 +166,7 @@ function parseRequestBody(req) {
 
 
 // ============================================================
-// QUERY PARAMETER HELPER
+// QUERY PARAMETERS
 // ============================================================
 
 function getQueryParameter(
@@ -228,10 +209,9 @@ function getQueryParameter(
       );
 
 
-    return (
-      requestUrl.searchParams
-        .get(name)
-    );
+    return requestUrl
+      .searchParams
+      .get(name);
 
   } catch {
 
@@ -247,14 +227,13 @@ function getQueryParameter(
 // Preferred:
 //
 // ?action=list_templates
-//
 // ?action=claim_test
-//
 // ?action=send_test_template
+// ?action=subscribe_waba
 //
-// JSON body remains supported as fallback.
+// JSON body action remains a fallback.
 //
-// Missing action NEVER defaults to a queue mutation.
+// Missing action never defaults to a mutating operation.
 // ============================================================
 
 function getRequestedAction(req) {
@@ -279,8 +258,7 @@ function getRequestedAction(req) {
 
 
   if (
-    typeof parsedBody.action ===
-      "string" &&
+    typeof parsedBody.action === "string" &&
     parsedBody.action.trim() !== ""
   ) {
     return parsedBody.action.trim();
@@ -292,7 +270,7 @@ function getRequestedAction(req) {
 
 
 // ============================================================
-// SUPABASE RPC HELPER
+// SUPABASE RPC
 // ============================================================
 
 async function callSupabaseRpc(
@@ -368,7 +346,7 @@ async function callSupabaseRpc(
 
 
 // ============================================================
-// META GRAPH GET HELPER
+// META GRAPH GET
 // ============================================================
 
 async function callMetaGraphGet(
@@ -445,13 +423,13 @@ async function callMetaGraphGet(
 
 
 // ============================================================
-// META GRAPH POST HELPER
+// META GRAPH POST
 // ============================================================
 
 async function callMetaGraphPost(
   accessToken,
   path,
-  body
+  body = null
 ) {
 
   const url =
@@ -460,25 +438,38 @@ async function callMetaGraphPost(
     `${path}`;
 
 
+  const options = {
+
+    method:
+      "POST",
+
+    headers: {
+      Authorization:
+        `Bearer ${accessToken}`,
+    },
+  };
+
+
+  if (
+    body !== null &&
+    body !== undefined
+  ) {
+
+    options.headers[
+      "Content-Type"
+    ] =
+      "application/json";
+
+
+    options.body =
+      JSON.stringify(body);
+  }
+
+
   const response =
     await fetch(
       url,
-      {
-        method: "POST",
-
-        headers: {
-          "Content-Type":
-            "application/json",
-
-          Authorization:
-            `Bearer ${accessToken}`,
-        },
-
-        body:
-          JSON.stringify(
-            body
-          ),
-      }
+      options
     );
 
 
@@ -508,7 +499,7 @@ async function callMetaGraphPost(
 
 
 // ============================================================
-// META WHATSAPP CONNECTION CHECK
+// META CONNECTION CHECK
 // ============================================================
 
 async function checkMetaConnection(
@@ -681,7 +672,7 @@ async function verifyTestTemplate(
 
 
 // ============================================================
-// SEND CONTROLLED META TEST TEMPLATE
+// CONTROLLED WHATSAPP TEST SEND
 // ============================================================
 
 async function sendControlledTestTemplate(
@@ -696,10 +687,6 @@ async function sendControlledTestTemplate(
     );
 
 
-  // Basic E.164-style digit validation.
-  //
-  // Meta receives the international number as digits.
-  //
   if (
     recipient.length < 8 ||
     recipient.length > 15
@@ -777,17 +764,66 @@ async function sendControlledTestTemplate(
   if (!providerMessageId) {
 
     throw new Error(
-      "Meta accepted request but returned no message ID"
+      "Meta returned no WhatsApp message ID"
     );
   }
 
 
   return {
+
     providerMessageId,
 
     messagingProduct:
       result.messaging_product ??
       "whatsapp",
+  };
+}
+
+
+// ============================================================
+// WABA WEBHOOK SUBSCRIPTION
+// ============================================================
+//
+// Meta endpoint:
+//
+// POST
+// /{WABA-ID}/subscribed_apps
+//
+// No request body is required.
+//
+// ============================================================
+
+async function subscribeAppToWaba(
+  accessToken,
+  businessAccountId
+) {
+
+  const result =
+    await callMetaGraphPost(
+      accessToken,
+
+      `${encodeURIComponent(
+        businessAccountId
+      )}/subscribed_apps`
+    );
+
+
+  const success =
+    result?.success === true ||
+    result?.success === "true";
+
+
+  if (!success) {
+
+    throw new Error(
+      "Meta did not confirm the WABA subscription"
+    );
+  }
+
+
+  return {
+    success:
+      true,
   };
 }
 
@@ -809,7 +845,7 @@ async function handler(
 
 
   // ==========================================================
-  // ENVIRONMENT VARIABLES
+  // ENVIRONMENT
   // ==========================================================
 
   const supabaseUrl =
@@ -916,10 +952,6 @@ async function handler(
 
     try {
 
-      // -------------------------------------------------------
-      // SUPABASE READ-ONLY CHECK
-      // -------------------------------------------------------
-
       const eligibilityResult =
         await callSupabaseRpc(
           supabaseUrl,
@@ -942,10 +974,6 @@ async function handler(
         eligibilityResult === true ||
         eligibilityResult === false;
 
-
-      // -------------------------------------------------------
-      // META READ-ONLY CHECK
-      // -------------------------------------------------------
 
       const metaConnection =
         await checkMetaConnection(
@@ -1018,9 +1046,6 @@ async function handler(
           status:
             "connection-error",
 
-          messageSendingMode:
-            "test_only",
-
           productionQueueSendingEnabled:
             false,
         });
@@ -1050,7 +1075,7 @@ async function handler(
 
 
   // ==========================================================
-  // AUTHENTICATE PROTECTED REQUEST
+  // AUTHENTICATION
   // ==========================================================
 
   const suppliedSecret =
@@ -1080,13 +1105,21 @@ async function handler(
 
 
   // ==========================================================
-  // DETERMINE ACTION
+  // ACTION
   // ==========================================================
 
   const action =
     getRequestedAction(
       req
     );
+
+
+  const allowedActions = [
+    "list_templates",
+    "claim_test",
+    "send_test_template",
+    "subscribe_waba",
+  ];
 
 
   if (!action) {
@@ -1101,11 +1134,7 @@ async function handler(
         error:
           "Worker action is required",
 
-        allowedActions: [
-          "list_templates",
-          "claim_test",
-          "send_test_template",
-        ],
+        allowedActions,
 
         productionQueueSendingEnabled:
           false,
@@ -1114,9 +1143,7 @@ async function handler(
 
 
   // ==========================================================
-  // ACTION: LIST META TEMPLATES
-  //
-  // READ ONLY
+  // ACTION: LIST TEMPLATES
   // ==========================================================
 
   if (
@@ -1141,9 +1168,6 @@ async function handler(
 
           error:
             "Meta environment is not configured",
-
-          productionQueueSendingEnabled:
-            false,
         });
     }
 
@@ -1153,18 +1177,7 @@ async function handler(
       const templates =
         await getMetaTemplates(
           whatsappAccessToken,
-
           whatsappBusinessAccountId
-        );
-
-
-      const approvedTemplates =
-        templates.filter(
-          (template) =>
-            String(
-              template.status
-            ).toUpperCase() ===
-            "APPROVED"
         );
 
 
@@ -1182,7 +1195,13 @@ async function handler(
             templates.length,
 
           approvedCount:
-            approvedTemplates.length,
+            templates.filter(
+              (template) =>
+                String(
+                  template.status
+                ).toUpperCase() ===
+                "APPROVED"
+            ).length,
 
           templates,
 
@@ -1196,7 +1215,7 @@ async function handler(
     } catch (error) {
 
       console.error(
-        "DIJO Meta template discovery failed:",
+        "DIJO template discovery failed:",
         error
       );
 
@@ -1213,9 +1232,6 @@ async function handler(
 
           error:
             "Meta template discovery failed",
-
-          productionQueueSendingEnabled:
-            false,
         });
     }
   }
@@ -1223,10 +1239,6 @@ async function handler(
 
   // ==========================================================
   // ACTION: CLAIM TEST
-  //
-  // TEST MODE ONLY
-  //
-  // NO META SEND
   // ==========================================================
 
   if (
@@ -1251,9 +1263,6 @@ async function handler(
 
           error:
             "Supabase worker environment is not configured",
-
-          productionQueueSendingEnabled:
-            false,
         });
     }
 
@@ -1373,7 +1382,7 @@ async function handler(
     } catch (error) {
 
       console.error(
-        "DIJO notification claim test failed:",
+        "DIJO claim test failed:",
         error
       );
 
@@ -1390,29 +1399,13 @@ async function handler(
 
           error:
             "Notification claim test failed",
-
-          productionQueueSendingEnabled:
-            false,
         });
     }
   }
 
 
   // ==========================================================
-  // ACTION: SEND CONTROLLED TEST TEMPLATE
-  //
-  // THIS IS THE ONLY ACTION IN THIS VERSION THAT SENDS
-  // A REAL WHATSAPP MESSAGE.
-  //
-  // SAFETY BOUNDARIES:
-  //
-  // - recipient comes ONLY from WHATSAPP_TEST_RECIPIENT
-  // - template is hard-coded
-  // - template parameters are hard-coded
-  // - caller cannot override recipient
-  // - caller cannot override template
-  // - notification_outbox is not touched
-  // - explicit confirmation is required
+  // ACTION: CONTROLLED TEST TEMPLATE SEND
   // ==========================================================
 
   if (
@@ -1472,19 +1465,12 @@ async function handler(
             "send_test_template",
 
           error:
-            "WhatsApp test-send environment is not configured",
-
-          productionQueueSendingEnabled:
-            false,
+            "WhatsApp test environment is not configured",
         });
     }
 
 
     try {
-
-      // -------------------------------------------------------
-      // Verify configured sender still belongs to the WABA.
-      // -------------------------------------------------------
 
       const metaConnection =
         await checkMetaConnection(
@@ -1512,17 +1498,10 @@ async function handler(
               "send_test_template",
 
             error:
-              "Configured WhatsApp Phone Number ID does not match the configured business account",
-
-            productionQueueSendingEnabled:
-              false,
+              "Configured phone number does not belong to configured WABA",
           });
       }
 
-
-      // -------------------------------------------------------
-      // Verify exact template still exists and is APPROVED.
-      // -------------------------------------------------------
 
       await verifyTestTemplate(
         whatsappAccessToken,
@@ -1530,10 +1509,6 @@ async function handler(
         whatsappBusinessAccountId
       );
 
-
-      // -------------------------------------------------------
-      // Send exactly one controlled template message.
-      // -------------------------------------------------------
 
       const sendResult =
         await sendControlledTestTemplate(
@@ -1587,7 +1562,7 @@ async function handler(
     } catch (error) {
 
       console.error(
-        "DIJO controlled WhatsApp test send failed:",
+        "DIJO controlled WhatsApp test failed:",
         error
       );
 
@@ -1607,6 +1582,109 @@ async function handler(
 
           error:
             "Controlled WhatsApp test send failed",
+        });
+    }
+  }
+
+
+  // ==========================================================
+  // ACTION: SUBSCRIBE APP TO WABA
+  //
+  // NO MESSAGE SEND
+  // NO SUPABASE MUTATION
+  // ==========================================================
+
+  if (
+    action ===
+    "subscribe_waba"
+  ) {
+
+    if (
+      !whatsappAccessToken ||
+      !whatsappBusinessAccountId
+    ) {
+
+      return res
+        .status(500)
+        .json({
+
+          ok:
+            false,
+
+          action:
+            "subscribe_waba",
+
+          error:
+            "Meta WABA environment is not configured",
+
+          productionQueueSendingEnabled:
+            false,
+        });
+    }
+
+
+    try {
+
+      const result =
+        await subscribeAppToWaba(
+          whatsappAccessToken,
+
+          whatsappBusinessAccountId
+        );
+
+
+      return res
+        .status(200)
+        .json({
+
+          ok:
+            true,
+
+          action:
+            "subscribe_waba",
+
+          subscribed:
+            result.success,
+
+          webhookEndpoint:
+            "/api/webhook",
+
+          messageSent:
+            false,
+
+          notificationQueueTouched:
+            false,
+
+          metaGraphVersion:
+            META_GRAPH_VERSION,
+
+          productionQueueSendingEnabled:
+            false,
+        });
+
+    } catch (error) {
+
+      console.error(
+        "DIJO WABA subscription failed:",
+        error
+      );
+
+
+      return res
+        .status(502)
+        .json({
+
+          ok:
+            false,
+
+          action:
+            "subscribe_waba",
+
+          subscribed:
+            false,
+
+          error:
+            "WABA subscription failed",
 
           productionQueueSendingEnabled:
             false,
@@ -1632,11 +1710,7 @@ async function handler(
       requestedAction:
         action,
 
-      allowedActions: [
-        "list_templates",
-        "claim_test",
-        "send_test_template",
-      ],
+      allowedActions,
 
       productionQueueSendingEnabled:
         false,
